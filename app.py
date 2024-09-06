@@ -1,118 +1,107 @@
-from flask import Flask, render_template, request, send_from_directory, flash, jsonify
-from flask_cors import CORS
-import folium
-import exifread
-from PIL import Image
 import os
-import requests
-import io
-import tempfile
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
+from datetime import datetime
+import csv
+import folium
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-app.secret_key = 'your_secret_key_here'
+def resize_image(input_path, output_path, max_width):
+    with Image.open(input_path) as img:
+        original_width, original_height = img.size
+        
+        if original_width > max_width:
+            ratio = max_width / original_width
+            new_height = int(original_height * ratio)
+            img = img.resize((max_width, new_height), Image.LANCZOS)
 
-def download_image(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        return io.BytesIO(response.content)
-    return None
+        img.save(output_path)
 
-def get_gps_coordinates(image_data):
-    exif_data = exifread.process_file(image_data)
-    if 'GPS GPSLatitude' in exif_data and 'GPS GPSLongitude' in exif_data:
-        lat_ref = exif_data['GPS GPSLatitudeRef'].values
-        lon_ref = exif_data['GPS GPSLongitudeRef'].values
-        lat = exif_data['GPS GPSLatitude'].values
-        lon = exif_data['GPS GPSLongitude'].values
-        lat = convert_to_degrees(lat, lat_ref)
-        lon = convert_to_degrees(lon, lon_ref)
-        print(f"GPS coordinates found: {lat}, {lon}")
-        return lat, lon
-    print("GPS coordinates not found in EXIF data")
-    return None, None
+def convert_to_degrees(value):
+    d, m, s = value
+    return d + (m / 60.0) + (s / 3600.0)
 
-def convert_to_degrees(value, ref):
-    d = float(value[0].num) / float(value[0].den)
-    m = float(value[1].num) / float(value[1].den)
-    s = float(value[2].num) / float(value[2].den)
-    decimal = d + (m / 60.0) + (s / 3600.0)
-    if ref in ['S', 'W']:
-        decimal = -decimal
-    return decimal
+def get_gps_coordinates(exif_data):
+    lat = lon = date_time = None
 
-def create_map_with_photos(photo_data):
-    coordinates = []
-    for i, photo_info in enumerate(photo_data):
+    if 'GPSInfo' in exif_data:
+        gps_info = {GPSTAGS.get(key, key): value for key, value in exif_data['GPSInfo'].items()}
+        
+        if 'GPSLatitude' in gps_info and 'GPSLongitude' in gps_info:
+            lat = convert_to_degrees(gps_info['GPSLatitude'])
+            lon = convert_to_degrees(gps_info['GPSLongitude'])
+            
+            if gps_info['GPSLatitudeRef'] != 'N':
+                lat = -lat
+            if gps_info['GPSLongitudeRef'] != 'E':
+                lon = -lon
+
+    if 'DateTimeOriginal' in exif_data:
+        date_time_str = exif_data['DateTimeOriginal']
         try:
-            image_data = download_image(photo_info['img_path'])
-            if image_data is None:
-                print(f"Failed to download image: {photo_info['img_path']}")
-                continue
+            date_time = datetime.strptime(date_time_str, '%Y:%m:%d %H:%M:%S')
+        except ValueError:
+            pass
 
-            lat, lon = get_gps_coordinates(image_data)
-            if lat is None or lon is None:
-                print(f"Position data not found: {photo_info['img_path']}")
-                continue
-            coordinates.append((lat, lon, photo_info['thumbnail_path'], i))
-        except Exception as e:
-            print(f"Error processing {photo_info['img_path']}: {str(e)}")
+    return lat, lon, date_time
 
-    if coordinates:
-        avg_lat = sum(lat for lat, _, _, _ in coordinates) / len(coordinates)
-        avg_lon = sum(lon for _, lon, _, _ in coordinates) / len(coordinates)
-        map = folium.Map(location=[avg_lat, avg_lon], zoom_start=8)
-    else:
-        map = folium.Map(location=[0, 0], zoom_start=2)
-        print("No valid coordinates found. Creating empty map.")
-        flash("No valid GPS data found in the uploaded images.")
-        return
+def process_images(photos_dir, static_dir, thumbnail_size):
+    if not os.path.exists(static_dir):
+        os.makedirs(static_dir)
 
-    for lat, lon, thumbnail_path, i in coordinates:
-        folium.Marker(
-            location=[lat, lon],
-            popup=folium.Popup(f'<img src="{thumbnail_path}" width="100" height="100">', max_width=200),
-            icon=folium.Icon(icon="camera")
-        ).add_to(map)
+    csv_path = os.path.join(static_dir, 'image_data.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow(['Filename', 'Latitude', 'Longitude', 'DateTime', 'Thumbnail'])
 
-    map_html = map.get_root().render()
-    with open('static/map_data.html', 'w') as f:
-        f.write(map_html)
-    print(f"Map created with {len(coordinates)} markers")
+        for filename in os.listdir(photos_dir):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                input_path = os.path.join(photos_dir, filename)
+                thumbnail_name = f'thumb_{filename}'
+                output_path = os.path.join(static_dir, thumbnail_name)
 
-@app.route('/', methods=['GET'])
-def index():
-    return render_template('index.html', map_created=False)
+                resize_image(input_path, output_path, thumbnail_size)
 
-@app.route('/process_exif', methods=['POST'])
-def process_exif():
-    data = request.json
-    photo_data = data.get('image_data', [])
-    
-    if not photo_data:
-        return jsonify({'error': 'No image data received', 'map_created': False}), 400
-    
-    try:
-        create_map_with_photos(photo_data)
-        return jsonify({'message': '画像の処理が完了しました。', 'map_created': True})
-    except Exception as e:
-        return jsonify({'error': str(e), 'map_created': False}), 500
+                with Image.open(input_path) as img:
+                    exif_data = {TAGS.get(key, key): value for key, value in img._getexif().items() if key in TAGS}
+                    lat, lon, date_time = get_gps_coordinates(exif_data)
 
-@app.route('/map')
-def show_map():
-    map_path = 'static/map_data.html'
-    if os.path.exists(map_path):
-        with open(map_path, 'r') as f:
-            map_html = f.read()
-        return render_template('map.html', map_exists=True, map_html=map_html)
-    else:
-        flash("Map not created yet. Please process images first.")
-        return render_template('map.html', map_exists=False)
+                if lat and lon and date_time:
+                    csv_writer.writerow([filename, lat, lon, date_time, thumbnail_name])
 
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory('static', filename)
+    return csv_path
 
-if __name__ == '__main__':
-    os.makedirs('static', exist_ok=True)
-    app.run(debug=True)
+def create_map_html(csv_path, output_html):
+    m = folium.Map(location=[0, 0], zoom_start=2)
+
+    with open(csv_path, 'r') as csvfile:
+        csv_reader = csv.reader(csvfile)
+        next(csv_reader)  # Skip header
+        for row in csv_reader:
+            filename, lat, lon, date_time, thumbnail = row
+            lat, lon = float(lat), float(lon)
+            
+            popup_html = f"""
+            <img src='static/{thumbnail}' width='150px'><br>
+            Filename: {filename}<br>
+            Date/Time: {date_time}
+            """
+            
+            folium.Marker(
+                location=[lat, lon],
+                popup=folium.Popup(popup_html, max_width=200),
+                icon=folium.Icon(icon='camera', prefix='fa')
+            ).add_to(m)
+
+    m.save(output_html)
+
+def main():
+    photos_dir = 'photos'
+    static_dir = 'static'
+    thumbnail_size = 200
+    output_html = 'index.html'
+
+    csv_path = process_images(photos_dir, static_dir, thumbnail_size)
+    create_map_html(csv_path, output_html)
+
+if __name__ == "__main__":
+    main()

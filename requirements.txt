@@ -1,8 +1,0 @@
-flask
-flask_cors 
-exifread
-folium
-pillow
-bottleneck
-pandas
-numexpr
